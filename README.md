@@ -9,3 +9,6 @@ Codes for plotting weighted blood pressure control and stratification by demogra
 Codes for elastic net regression and random forest classifier are in: fitting_models.Rmd
 
 Codes for plots for variables and weighted logistic regression are in: logistic_regression.Rmd
+
+Haina Jin
+May 7, 2025
