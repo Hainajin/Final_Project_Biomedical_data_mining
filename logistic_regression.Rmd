@@ -1,0 +1,241 @@
+---
+title: "plot variables"
+output: html_document
+date: "2025-05-06"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE, warning=FALSE}
+library(ggplot2)
+library(dplyr)
+library(tidyverse)
+library(srvyr)
+library(ggplot2)
+library(survey)
+```
+
+```{r}
+load("variables of interest.RData")
+load("nhanes_designb.RData")
+```
+
+```{r}
+print(unique_dec)
+```
+
+```{r}
+print(rownames(var_rf_filtered))
+```
+# cc_smoke = Former is in unique_dec, convert it to cc_smoke
+```{r}
+unique_dec <- gsub("cc_smokeFormer", "cc_smoke", unique_dec)
+```
+
+```{r}
+load("cleaned_up_raw_data.RData")
+```
+
+
+```{r}
+
+# Step 1: Subset your variables of interest
+vars_of_interest <- rownames(var_rf_filtered)  # Already filtered
+survey_data <- nhanes_srvyr %>%
+  select(all_of(vars_of_interest), Survey_Year)
+```
+
+
+```{r}
+# Step 2: Convert categorical Yes/No into numeric (1/0)
+survey_data <- survey_data %>%
+  mutate(cc_smoke = if_else(cc_smoke == "Former", 1, 0))
+survey_data <- survey_data %>%
+  mutate(chol_nonhdl_5cat = ifelse(chol_nonhdl_5cat == "100 to <130 mg/dL", 1, 0))
+survey_data <- survey_data %>%
+  mutate(chol_measured_last = ifelse(chol_measured_last == "In the past year", 1, 0))
+
+survey_data <- survey_data %>%
+  mutate(across(
+    .cols = where(~ !is.numeric(.)),  # Target only non-numeric columns
+    .fns = ~ case_when(
+      . == "Yes" ~ 1,        # Convert 'Yes' to 1
+      . != "Yes" ~ 0,        # Convert all other values to 0
+      TRUE ~ NA_real_        # Keep NA values as NA
+    )
+  ))
+
+
+# Step 3: Compute weighted means (proportions for binary vars) by Survey_Year
+summary_stats <- survey_data %>%
+  group_by(Survey_Year) %>%
+  summarise(across(
+    everything(),
+    ~ survey_mean(., na.rm = TRUE),
+    .names = "{.col}"
+  ), .groups = "drop")
+
+# Step 4: Convert to long format for ggplot
+plot_data <- summary_stats %>%
+  pivot_longer(-Survey_Year, names_to = "Variable", values_to = "Proportion")
+
+# Step 5: Plot weighted means over time
+p <- ggplot(plot_data, aes(x = as.factor(Survey_Year), y = Proportion)) +
+  geom_line(aes(group = Variable), color = "steelblue", size = 1) +
+  geom_point(color = "darkred", size = 2) +
+  #geom_text(aes(y = Proportion, label = round(Proportion, 2)), vjust = -1, size = 3) +
+  facet_wrap(~ Variable, scales = "free") +
+  labs(title = "Weighted Proportions by Survey Year",
+       x = "Survey Year",
+       y = "Weighted Proportion") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1), panel.spacing = unit(1, "lines"))
+ggsave("whole plot of variables of interest.pdf", p, width = 30, height = 30, units = "in")
+```
+
+```{r}
+
+survey_data_for_reg <- nhanes_srvyr %>%
+  dplyr::select(all_of(c(vars_of_interest, "bp_control_binary", "Survey_Year", 
+                  "demo_race", "demo_gender", "demo_age_cat", 
+                  "svy_psu", "svy_strata", "svy_weight_mec"))) %>%
+  mutate(post2013 = ifelse(Survey_Year >= 2013, 1, 0)) %>%
+  na.omit()
+
+nhanes_design_reg <- svydesign(
+  id      = ~svy_psu,
+  strata  = ~svy_strata,
+  weights = ~svy_weight_mec,
+  nest    = TRUE,
+  data    = survey_data_for_reg
+)
+model_formula1 <- as.formula(
+  paste("bp_control_binary ~", paste(c("demo_race", "demo_gender", "demo_age_cat", vars_of_interest), collapse = " + "))
+)
+
+model1 <- survey::svyglm(model_formula1, design = survey_data_for_reg, family = quasibinomial())
+summary(model1)
+
+```
+
+```{r}
+```
+
+
+```{r}
+vars_of_trend <- c("ascvd_risk_vh_ahaacc", "bp_med_use", "chol_measured_last", "chol_med_use", "htn_aware", "LBXSCLSI","LBXSTP", "LBXPLTSI")
+formula2 <- as.formula(
+  paste("bp_control_binary ~", paste(c("demo_race", "demo_gender", "demo_age_cat", vars_of_trend), collapse = " + "))
+)
+
+model2 <- survey::svyglm(formula2, design = survey_data_for_reg, family = quasibinomial())
+summary(model2)
+exp(coef(model2))
+```
+
+```{r}
+formula2_interact <- as.formula(
+  paste("bp_control_binary ~ post2013 * (", paste(c("demo_race", "demo_gender", "demo_age_cat", vars_of_trend), collapse = " + "), ")")
+)
+model2_interact <- survey::svyglm(formula2_interact, design = survey_data_for_reg, family = quasibinomial())
+summary(model2_interact)
+
+```
+```{r}
+# Extract coefficients summary
+model_summary <- summary(model2_interact)
+
+# Create a tidy data frame
+coef_df <- as.data.frame(coef(model_summary))
+coef_df$Variable <- rownames(coef_df)
+
+# Compute Odds Ratio and 95% CI
+coef_df$OR <- exp(coef_df$Estimate)
+coef_df$Lower_CI <- exp(coef_df$Estimate - 1.96 * coef_df$`Std. Error`)
+coef_df$Upper_CI <- exp(coef_df$Estimate + 1.96 * coef_df$`Std. Error`)
+
+# Keep only significant terms (e.g., p < 0.05)
+sig_df <- coef_df[coef_df$`Pr(>|t|)` < 0.05, ]
+
+# Rearrange and rename columns for clarity
+library(dplyr)
+sig_table <- sig_df %>%
+  select(Variable, OR, Lower_CI, Upper_CI, p_value = `Pr(>|t|)`) %>%
+  arrange(p_value)
+
+# Show the table
+print(sig_table)
+
+```
+
+# selectively plot vars of trend and two no trend var
+```{r}
+vars_to_plot <- c("ascvd_risk_vh_ahaacc", "bp_med_use", "chol_measured_last", "chol_med_use", "htn_aware", "LBXSCLSI","LBXSTP", "LBXPLTSI", "cc_smoke", "cc_diabetes")
+survey_data_plot <- nhanes_srvyr %>%
+  select(all_of(vars_to_plot), Survey_Year)
+# Step 2: Convert categorical Yes/No into numeric (1/0)
+survey_data_plot <- survey_data_plot %>%
+  mutate(cc_smoke = if_else(cc_smoke == "Former", 100, 0))
+survey_data_plot <- survey_data_plot %>%
+  mutate(chol_measured_last = ifelse(chol_measured_last == "In the past year", 100, 0))
+
+survey_data_plot <- survey_data_plot %>%
+  mutate(across(
+    .cols = where(~ !is.numeric(.)),  # Target only non-numeric columns
+    .fns = ~ case_when(
+      . == "Yes" ~ 100,        # Convert 'Yes' to 1
+      . != "Yes" ~ 0,        # Convert all other values to 0
+      TRUE ~ NA_real_        # Keep NA values as NA
+    )
+  ))
+
+
+# Step 3: Compute weighted means (proportions for binary vars) by Survey_Year
+summary_stats_plot <- survey_data_plot %>%
+  group_by(Survey_Year) %>%
+  summarise(across(
+    everything(),
+    ~ survey_mean(., na.rm = TRUE, vartype = NULL),
+    .names = "{.col}"
+  ), .groups = "drop")
+
+# Step 4: Convert to long format for ggplot
+plot_data <- summary_stats_plot %>%
+  pivot_longer(-Survey_Year, names_to = "Variable", values_to = "Proportion")
+```
+
+
+```{r}
+# Set custom facet order: put cc_smoke and cc_diabetes last
+custom_order <- setdiff(unique(plot_data$Variable), c("cc_smoke", "cc_diabetes"))
+custom_order <- c(sort(custom_order), "cc_smoke", "cc_diabetes")
+
+# Reorder factor
+plot_data$Variable <- factor(plot_data$Variable, levels = custom_order)
+facet_labels <- setNames(
+  paste0(LETTERS[1:length(custom_order)], ". ", custom_order),
+  custom_order
+)
+# Plot with facet tags (ABCD...)
+p2 <- ggplot(plot_data, aes(x = as.factor(Survey_Year), y = Proportion)) +
+  geom_line(aes(group = Variable), color = "steelblue", size = 1) +
+  geom_point(color = "steelblue", size = 2) +
+  geom_text(aes(label = round(Proportion, 2)), vjust = 2, size = 2.5) +
+  facet_wrap(~ Variable, scales = "free", nrow = 2 ,labeller = as_labeller(facet_labels)) +
+  labs(title = "Weighted Proportions by Survey Year",
+       x = "Survey Year",
+       y = "Weighted Proportion") +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    panel.spacing = unit(1, "lines"),
+    strip.text = element_text(size = 10),
+    legend.position = "none"
+  ) +
+  patchwork::plot_annotation(tag_levels = 'A')  # Adds A, B, C, ...
+
+ggsave("Selected plot of variables of interest.pdf", p2, width = 18, height = 6, units = "in")
+```
+

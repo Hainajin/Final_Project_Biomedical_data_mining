@@ -1,0 +1,138 @@
+---
+title: "plot with weighted props"
+output: html_document
+date: "2025-05-06"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, warning=FALSE, message=FALSE}
+library(dplyr)   
+library(survey) 
+library(ggplot2) 
+library(srvyr)
+library(tidyverse)
+library(patchwork)
+library(ggrepel)
+```
+
+```{r}
+load("cleaned_up_raw_data.RData")
+```
+
+# construct NHANES survey design
+```{r}
+nhanes_design <- svydesign(
+  id      = ~svy_psu,
+  strata  = ~svy_strata,
+  weights = ~svy_weight_mec,
+  nest    = TRUE,
+  data    = data_filtered
+)
+
+```
+
+# compute the weighted proportions for BP Control by Year
+```{r}
+nhanes_srvyr <- as_survey_design(nhanes_design)
+save(nhanes_design, nhanes_srvyr, file = "nhanes_designb.RData")
+bp_control_svy <- nhanes_srvyr %>%
+  mutate(bp_control_binary = bp_control_accaha == "Yes") %>%
+  group_by(Survey_Year) %>%
+  summarize(
+    bp_control_rate = survey_mean(bp_control_binary, vartype = "ci", na.rm = TRUE)
+  )
+bp_control_svy <- bp_control_svy %>%
+  mutate(bp_control_rate = bp_control_rate * 100,
+         bp_control_rate_low = bp_control_rate_low * 100,
+         bp_control_rate_upp = bp_control_rate_upp * 100)
+```
+
+
+# plot BP ctrl by year
+```{r}
+p1 <- ggplot(bp_control_svy, aes(x = factor(Survey_Year), y = bp_control_rate, group = 1)) +
+  geom_line(size = 1, colour = "steelblue", alpha = 0.5) +
+    geom_point(size = 2, colour = "steelblue") +
+    geom_ribbon(aes(ymin = bp_control_rate_low, ymax = bp_control_rate_upp), alpha = 0.1, color = NA) +
+  geom_text(aes(label = sprintf("%.1f", bp_control_rate)), 
+            vjust = -1, size = 3) + 
+  labs(
+    title = "Weighted BP Control Over Time",
+    x = "Survey Year",
+    y = "Controlled BP in Percent (95% CI)"
+  ) +
+  theme_classic()
+p1
+```
+
+
+# stratify by gender, age, race
+
+```{r}
+strat_vars <- c("demo_gender", "demo_race","demo_age_cat")
+plots <- list()
+for (var in strat_vars) {
+  
+  bp_control_svy <- nhanes_srvyr %>%
+    mutate(bp_control_binary = bp_control_accaha == "Yes") %>%
+    group_by(Survey_Year, !!sym(var)) %>%
+    summarize(
+      bp_control_rate = survey_mean(bp_control_binary, vartype = "ci", na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      bp_control_rate = bp_control_rate * 100,
+      bp_control_rate_low = bp_control_rate_low * 100,
+      bp_control_rate_upp = bp_control_rate_upp * 100
+    ) %>%
+    rename(group = !!sym(var))  # for use in ggplot
+# Identify label points
+label_years <- c(1999, 2013, 2017)
+bp_control_labels <- bp_control_svy %>% filter(Survey_Year %in% label_years)
+
+  # Plotting
+  p <- ggplot(bp_control_svy, aes(x = Survey_Year, y = bp_control_rate, color = group, fill = group)) +
+    geom_line(size = 1, alpha = 0.5) +
+    geom_point(size = 2, alpha = 0.5) +
+     geom_text_repel(
+    data = bp_control_labels,
+    aes(label = round(bp_control_rate, 1)),
+    size = 3,
+    direction = "y",
+    segment.size = 0.2,
+    segment.color = "grey50",
+    max.overlaps = Inf,
+    show.legend = FALSE
+  ) +
+    #geom_ribbon(aes(ymin = bp_control_rate_low, ymax = bp_control_rate_upp), alpha = 0.1, color = NA) +
+    labs(
+      title = paste("BP Control by", gsub("_", " ", var)),
+      x = "Survey Year",
+      y = "Controlled BP (%)",
+      color = gsub("_", " ", tools::toTitleCase(var)),
+      fill = gsub("_", " ", tools::toTitleCase(var))
+    ) +
+    theme_classic() +
+    theme(legend.position = "right", 
+          legend.text = element_text(size = 5), 
+      legend.title = element_text(size = 6))
+
+  plots[[var]] <- p  # Store plot in the list
+}
+
+
+```
+
+```{r}
+# Combine all plots in a single row (1x4 grid)
+combined_plot <- p1 + plots$demo_gender + plots$demo_race + plots$demo_age_cat + 
+  plot_layout(ncol = 4)+ plot_annotation(tag_levels = 'A')  # Set layout to have 4 plots in 1 row
+
+# Print combined plot
+print(combined_plot)
+ggsave("metadata_analysis.pdf", plot = combined_plot, width = 18, height = 4, units = "in")
+```
+

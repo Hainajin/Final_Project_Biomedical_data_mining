@@ -1,0 +1,170 @@
+---
+title: "Final_project_data_cleanup"
+output: html_document
+date: "2025-04-13"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+library needed packages
+```{r, warning=FALSE, message=FALSE}
+library("dplyr")
+library("tidyverse")
+library("ggplot2")
+library("scales")
+library("ggpubr")
+library(glmnet)
+library(ggrepel)
+
+```
+
+read in dataset
+```{r}
+data <- read.csv("Preprocessed_data.csv")
+```
+
+check the survey year, and only keep the data no earlier than 2013
+```{r}
+min(data$Survey_Year) # 1999
+max(data$Survey_Year) # 2017
+data_filtered <- data %>%
+  filter(Survey_Year >= 2013)
+dim(data_filtered) # 9549 160
+```
+# define plot theme
+```{r}
+pub_theme <- theme_classic() +
+  theme(plot.title = element_text(size = 8)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  theme(
+    legend.title = element_text(size = 8),       # Title font
+    legend.text = element_text(size = 6),        # Labels font
+    legend.key.size = unit(0.3, "cm"),           # Box size
+    legend.spacing.y = unit(0.1, "cm")           # Vertical spacing
+  )
+```
+
+
+we will be using the blood pressure -hypertension definition defined by the 2017 ACC/AHA BP guideline.
+For our  study, we will only be using the population that does have hypertension.
+
+We will be using the blood pressure controlled defined by the 2017 ACC/AHA BP guideline.
+We will change the variable to have 1 = controlled, 0 = not controlled and save it to a new variable bp_control_binary
+
+```{r}
+data_filtered <- data
+data_filtered <- data_filtered %>%
+  filter(htn_accaha == "Yes")
+data_filtered$bp_control_binary <- ifelse(data_filtered$bp_control_accaha == "Yes", 1, 0)
+
+```
+
+#### data cleaning and imputation
+We will then remove variables that have missing values over 50% and show the removed values
+we will then impute numerical values with their median and categorical varibles with their mode
+```{r}
+# Calculate proportion of missing values per column
+missing_prop <- colMeans(is.na(data_filtered))
+
+# Identify columns to remove (more than 50% missing)
+removed_vars <- names(missing_prop[missing_prop > 0.5])
+#"chol_total"    "chol_hdl"      "chol_trig"     "chol_ldl"      "chol_nonhdl"  
+# "LBDHDL"        "LBDLDL"        "FriedewaldLDL"
+# Print the removed variable names
+print(removed_vars)
+
+data_filtered <- data_filtered[, missing_prop <= 0.5] # 153 variables left
+
+```
+
+imputation
+```{r}
+# impute variables, fill numeric with mean
+#Convert all "missing" strings (empty, "NA", etc.) to proper NA
+data_filtered[data_filtered == ""] <- NA
+data_filtered[data_filtered == "NA"] <- NA
+save(data_filtered, file = "unimputed_data.RData")
+
+
+# impute variables, fill categorical with mode
+# Define a mode function
+Mode <- function(x) {
+  ux <- na.omit(unique(x))
+  ux[which.max(tabulate(match(x, ux)))]
+}
+# Impute numeric and categorical columns
+data_filtered <- data_filtered %>%
+  mutate(across(where(is.numeric), ~ ifelse(is.na(.), median(., na.rm = TRUE), .))) %>%
+  mutate(across(where(~ is.factor(.) || is.character(.)), ~ {
+    val <- .
+    val[is.na(val)] <- Mode(val)
+    return(val)
+  }))
+
+# Identify columns that have only one unique value
+constant_cols <- sapply(data_filtered, function(x) length(unique(x[!is.na(x)])) <= 1)
+
+# List of columns with only one unique value
+constant_vars <- names(constant_cols[constant_cols == TRUE])
+
+# Remove these constant columns from the dataset
+data_filtered <- data_filtered[, !names(data_filtered) %in% constant_vars]
+
+save(data_filtered, file = "cleaned_up_raw_data.RData")
+```
+
+```{r}
+load("cleaned_up_raw_data.RData")
+```
+
+
+```{r}
+set.seed(123)
+# remove variables that are less meaningful, or leaking variables, or we know to have definite effects such as bp measurements, survey year...
+data_for_reg <- data_filtered %>%
+  select(-svy_weight_mec, -svy_strata, -svy_id, -bp_control_accaha, -bp_sys_mean, -bp_dia_mean, -svy_strata, -Begin_Year,  -YEAR, -BPXSY1,-BPXSY2, -BPXSY3, -BPXDI1, -BPXDI2, -BPXDI3,-SDDSRVYR, -demo_race, -demo_age_cat, -demo_gender, -svy)
+# separate the data into data before and after 2013: increase and decrease phase
+data_for_reg_inc <- data_for_reg %>% 
+  filter(Survey_Year < 2013) %>% 
+  select(-Survey_Year)
+data_for_reg_dec <- data_for_reg %>% 
+  filter(Survey_Year >= 2013) %>% 
+  select(-Survey_Year)
+# Add binary outcome variable AFTER dropping it
+data_for_reg_inc$bp_control_binary <- as.factor(data_for_reg_inc$bp_control_binary)
+data_for_reg_dec$bp_control_binary <- as.factor(data_for_reg_dec$bp_control_binary)
+# scale numeric variables
+data_for_reg_inc <- data_for_reg_inc %>%
+  mutate(across(where(is.numeric), ~ scale(.)[, 1]))
+data_for_reg_dec <- data_for_reg_dec %>%
+  mutate(across(where(is.numeric), ~ scale(.)[, 1]))
+
+# Convert all "Yes"/"No" in a dataframe to 1/0
+data_for_reg_inc_cleaned <- data_for_reg_inc
+data_for_reg_inc_cleaned[] <- lapply(data_for_reg_inc_cleaned, function(x) {
+  if (is.character(x) || is.factor(x)) {
+    x <- as.character(x)
+    if (all(x %in% c("Yes", "No", NA))) {
+      return(ifelse(x == "Yes", 1, ifelse(x == "No", 0, NA)))
+    }
+  }
+  return(x)
+})
+data_for_reg_dec_cleaned <- data_for_reg_dec
+data_for_reg_dec_cleaned[] <- lapply(data_for_reg_dec_cleaned, function(x) {
+  if (is.character(x) || is.factor(x)) {
+    x <- as.character(x)
+    if (all(x %in% c("Yes", "No", NA))) {
+      return(ifelse(x == "Yes", 1, ifelse(x == "No", 0, NA)))
+    }
+  }
+  return(x)
+})
+```
+
+```{r}
+save(data_for_reg_dec_cleaned, data_for_reg_inc_cleaned,data_for_reg, file = "cleaned_data.RData")
+```
+

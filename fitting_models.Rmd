@@ -1,0 +1,228 @@
+---
+title: "model_fitting"
+output: html_document
+date: "2025-05-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, warning=FALSE, message=FALSE}
+library(glmnet)
+library(ggplot2)
+library(dplyr)
+library(tidyverse)
+```
+
+```{r}
+load("cleaned_data.RData")
+```
+
+```{r}
+data_for_reg_dec_cleaned <- data_for_reg_dec_cleaned %>% select(-svy_psu, -RIDAGEYR)
+data_for_reg_inc_cleaned <- data_for_reg_inc_cleaned %>% select(-svy_psu, -RIDAGEYR)
+```
+
+
+```{r}
+fit_net_elastic <- function(data, alpha_val = 0.5, seed = 123) {
+  # Ensure required library is loaded
+  if (!require(glmnet)) install.packages("glmnet")
+  library(glmnet)
+  
+  set.seed(seed)
+  
+  # Create design matrix (drop intercept)
+  x.full <- model.matrix(bp_control_binary ~ ., data = data)[, -1]
+  y.full <- data$bp_control_binary
+  
+  # Split into train/test (70/30)
+  train_idx <- sample(seq_len(nrow(x.full)), size = 0.7 * nrow(x.full))
+  x.train <- x.full[train_idx, ]
+  x.test <- x.full[-train_idx, ]
+  y.train <- y.full[train_idx]
+  y.test <- y.full[-train_idx]
+  
+  # Lambda grid
+  grid <- 10^seq(10, -2, length = 100)
+  
+  # Cross-validation
+  cv.out <- cv.glmnet(x.train, y.train, alpha = alpha_val, family = "binomial", lambda = grid, nfolds = 10)
+  best_lam <- cv.out$lambda.min
+  
+  # Fit final model
+  lasso.mod <- glmnet(x.train, y.train, alpha = alpha_val, family = "binomial", lambda = best_lam)
+  
+  # Predict on test
+  lasso.pred.prob <- predict(lasso.mod, newx = x.test, type = "response")
+  lasso.pred.class <- ifelse(lasso.pred.prob > 0.5, 1, 0)
+  accuracy <- mean(lasso.pred.class == y.test)
+  
+  # Extract non-zero coefficients as a named matrix (excluding intercept)
+  coef_matrix <- as.matrix(coef(lasso.mod, s = best_lam))
+  nonzero_coef_matrix <- coef_matrix[coef_matrix[, 1] != 0, , drop = FALSE]
+  nonzero_coef_matrix <- nonzero_coef_matrix[rownames(nonzero_coef_matrix) != "(Intercept)", , drop = FALSE]
+  
+  # Return all relevant outputs
+  return(list(
+    model = lasso.mod,
+    best_lambda = best_lam,
+    accuracy = accuracy,
+    nonzero_coefficients = nonzero_coef_matrix
+  ))
+}
+
+```
+
+```{r}
+result_dec <- fit_net_elastic(data_for_reg_dec_cleaned)
+result_inc <- fit_net_elastic(data_for_reg_inc_cleaned)
+
+# View selected variables
+result_dec$nonzero_coefficients
+result_inc$nonzero_coefficients
+
+# Compare accuracy
+result_dec$accuracy
+result_inc$accuracy
+
+```
+
+# find variables that are different in increase and decrease phase
+```{r}
+# Extract selected variables
+vars_dec <- rownames(result_dec$nonzero_coefficients)
+vars_inc <- rownames(result_inc$nonzero_coefficients)
+
+# Shared variables
+shared_vars <- intersect(vars_dec, vars_inc)
+
+# Unique to decrease phase
+unique_dec <- setdiff(vars_dec, vars_inc)
+
+# Unique to increase phase
+unique_inc <- setdiff(vars_inc, vars_dec)
+
+# Display
+cat("Variables selected in BOTH phases:\n")
+print(shared_vars)
+
+cat("\nVariables selected ONLY in DECREASE phase:\n")
+print(unique_dec)
+
+cat("\nVariables selected ONLY in INCREASE phase:\n")
+print(unique_inc)
+```
+```{r}
+# Create a comparison data frame
+coef_comparison <- data.frame(
+  Variable = shared_vars,
+  Coef_Decrease = result_dec$nonzero_coefficients[shared_vars, 1],
+  Coef_Increase = result_inc$nonzero_coefficients[shared_vars, 1]
+)
+
+# Add direction comparison
+coef_comparison$Same_Direction <- sign(coef_comparison$Coef_Decrease) == sign(coef_comparison$Coef_Increase)
+
+# Add magnitude difference
+coef_comparison$Magnitude_Diff <- abs(coef_comparison$Coef_Decrease - coef_comparison$Coef_Increase)
+
+# Optional: sort by magnitude difference
+coef_comparison <- coef_comparison[order(-coef_comparison$Magnitude_Diff), ]
+
+# Display the table
+print(coef_comparison)
+```
+
+# use variables of interest for randomforest classifier
+```{r}
+var_oi <- unique(c(shared_vars, unique_dec))
+var_oi <- gsub("chol_nonhdl_5cat100 to <130 mg/dL", "chol_nonhdl_5cat", var_oi)
+var_oi <- gsub("cc_smokeFormer", "cc_smoke", var_oi)
+var_oi <- gsub("chol_measured_lastIn the past year", "chol_measured_last", var_oi)
+var_oi <- var_oi[var_oi != "cc_smokeNever"]
+
+data_for_rf <- data_for_reg_dec_cleaned %>% dplyr::select(c("bp_control_binary", var_oi))
+```
+
+# run random forest classifier
+```{r}
+fit_rf <- function(data, response_var = "bp_control_binary", seed = 123) {
+  # Ensure required libraries are loaded
+  if (!requireNamespace("caret", quietly = TRUE)) install.packages("caret")
+  if (!requireNamespace("randomForest", quietly = TRUE)) install.packages("randomForest")
+  if (!requireNamespace("pROC", quietly = TRUE)) install.packages("pROC")
+  
+  library(caret)
+  library(randomForest)
+  library(pROC)
+  
+  set.seed(seed)
+  
+  # Ensure response variable is numeric/factor binary
+  data[[response_var]] <- as.factor(data[[response_var]])
+  
+  # Split data
+  train_idx <- sample(1:nrow(data), 0.7 * nrow(data))
+  data.train <- data[train_idx, ]
+  data.test <- data[-train_idx, ]
+  
+  # Train Random Forest model
+  rf_model <- randomForest(as.formula(paste(response_var, "~ .")),
+                           data = data.train,
+                           mtry = floor(sqrt(ncol(data.train) - 1)),
+                           ntree = 500,
+                           importance = TRUE)
+  
+  # Predict probabilities and class
+  data.prob <- predict(rf_model, newdata = data.test, type = "prob")[, 2]
+  data.pred <- ifelse(data.prob > 0.5, 1, 0)
+  
+  # Convert to factor for confusionMatrix
+  data.pred <- factor(data.pred, levels = c(0, 1))
+  actual <- factor(data.test[[response_var]], levels = c(0, 1))
+  
+  conf_matrix <- confusionMatrix(data.pred, actual)
+  print(conf_matrix)
+  
+  # ROC
+  r <- roc(actual, data.prob, plot = TRUE, print.auc = TRUE, main = "Random Forest ROC")
+  
+  # Metrics
+  accuracy <- conf_matrix$overall['Accuracy']
+  precision <- conf_matrix$byClass['Precision']
+  auc <- auc(r)
+  
+  return(list(
+    model = rf_model,
+    accuracy = accuracy,
+    precision = precision,
+    auc = auc
+  ))
+}
+
+
+```
+
+```{r}
+result_rf <- fit_rf(data_for_rf)
+varImpPlot(result_rf$model, main = "Variable Importance in Random Forest")
+importance(result_rf$model)
+```
+```{r}
+result_rf_all <- fit_rf(data_for_reg_dec_cleaned)
+varImpPlot(result_rf_all$model, main = "Variable Importance in Random Forest")
+```
+
+```{r}
+var_rf <- importance(result_rf$model)
+var_rf <- as.data.frame(var_rf)
+var_rf_filtered <- var_rf %>% filter(MeanDecreaseAccuracy > 0)
+```
+
+```{r}
+save(var_rf_filtered, shared_vars, unique_dec, file = "variables of interest.RData")
+```
+
+
